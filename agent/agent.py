@@ -1,21 +1,46 @@
-from dotenv import load_dotenv
-load_dotenv()
-import os
-import openai
-import json
-import httpx
-import asyncio
-import logging
-from logging.handlers import RotatingFileHandler
-import uuid
-import time
+"""
+K8s Agent with Natural Language Interface
 
-# Environment variables
-openai.api_key = os.getenv("OPENAI_API_KEY")
-MCP_SERVER_URL = "http://localhost:8080/mcp" # Base URL for the server
+A conversational agent that translates natural language commands into Kubernetes operations.
+Supports simple commands and multi-step diagnostic reasoning powered by GPT-4.
+"""
+
+# Standard library
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
+from logging.handlers import RotatingFileHandler
+
+# Third-party
+import httpx
+import openai
+from dotenv import load_dotenv
+
+# Load configuration
+load_dotenv()
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# API Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
+MCP_SERVER_URL = "http://localhost:8080/mcp"
 SESSION_ID = "vscode-session"
 
-# --- Logging setup for agent ---
+# Diagnostic Mode Settings
+MAX_DIAGNOSTIC_ITERATIONS = 5
+MAX_LLM_CALLS = 20  # Safety limit to prevent runaway costs
+
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
 logs_dir = os.path.join(os.getcwd(), "logs")
 os.makedirs(logs_dir, exist_ok=True)
 agent_log_path = os.path.join(logs_dir, "agent.log")

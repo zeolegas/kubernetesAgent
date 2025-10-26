@@ -1,6 +1,18 @@
+"""
+Kubernetes kubectl command builders for the MCP server.
+
+This module generates kubectl commands for various Kubernetes operations.
+Functions return command strings that are executed by the server.
+"""
+
 import textwrap
 import base64
-# Generic resource management
+
+
+# =============================================================================
+# GENERIC RESOURCE OPERATIONS
+# =============================================================================
+
 def get_resources(
     resource_type: str,
     resource_name: str = "",
@@ -21,7 +33,6 @@ def get_resources(
         label_selector: Optional Kubernetes label selector string (e.g., 'app=myapp,env in (staging,prod)').
                         Ignored when resource_name is provided.
     """
-    # Build base command
     selector_part = f"-l \"{label_selector}\"" if (label_selector and not resource_name) else ""
     if all_namespaces:
         cmd = f"kubectl get {resource_type} -A {selector_part}".strip()
@@ -31,6 +42,7 @@ def get_resources(
         return f"{cmd} -o json" if structured_output else cmd
     cmd = f"kubectl get {resource_type} -n {namespace} {selector_part}".strip()
     return f"{cmd} -o json" if structured_output else cmd
+
 
 def describe_resource(
     resource_type: str,
@@ -50,17 +62,33 @@ def describe_resource(
                    (uses 'kubectl get -o yaml' instead of 'describe').
     """
     if structured_output:
-        # Prefer JSON for programmatic parsing
         return f"kubectl get {resource_type} {resource_name} -n {namespace} -o json"
-
     if full_yaml:
-        # Get the full YAML definition (better for structured data analysis by an LLM)
         return f"kubectl get {resource_type} {resource_name} -n {namespace} -o yaml"
-        
-    # Default behavior: use kubectl describe
     return f"kubectl describe {resource_type} {resource_name} -n {namespace}"
 
-# Pod-specific commands
+
+def get_events(namespace: str = "default", watch: bool = False, sort_by_time: bool = True) -> str:
+    """
+    Gets cluster events.
+    
+    Args:
+        namespace: The namespace to query (or use -A for all).
+        watch: If True, streams the events as they occur (-w).
+        sort_by_time: If True, sorts events by timestamp (recommended).
+    """
+    watch_str = "-w" if watch else ""
+    sort_str = "--sort-by='.lastTimestamp'" if sort_by_time else ""
+    
+    if namespace.lower() in ("all", "*"):
+         return f"kubectl get events -A {watch_str} {sort_str}".strip()
+    return f"kubectl get events -n {namespace} {watch_str} {sort_str}".strip()
+
+
+# =============================================================================
+# POD OPERATIONS
+# =============================================================================
+
 def get_pod_logs(
     pod_name: str = "",
     namespace: str = "default",
@@ -88,7 +116,6 @@ def get_pod_logs(
     all_cont_part = "--all-containers" if all_containers else ""
     selector_part = f"-l \"{label_selector}\"" if (label_selector and not pod_name) else ""
     
-    # Concatenate all parts cleanly
     flags = f"{container_part} {all_cont_part} {previous_part} {follow_part} {selector_part}".strip()
     base = f"kubectl logs -n {namespace}"
     if selector_part:
@@ -96,6 +123,7 @@ def get_pod_logs(
     if not pod_name:
         return "# Error: Provide 'pod_name' or 'label_selector' to select target pods for logs"
     return f"{base} {pod_name} {flags}".strip()
+
 
 def get_pod_usage(
     resource_type: str = "pods",
@@ -115,8 +143,6 @@ def get_pod_usage(
         all_namespaces: If True, query across all namespaces (uses -A).
         sort_by: Optional sort column ('cpu', 'memory', or '').
     """
-    
-    # Base command is always 'kubectl top'
     cmd = f"kubectl top {resource_type}"
 
     if resource_name:
@@ -125,19 +151,134 @@ def get_pod_usage(
     if all_namespaces:
         cmd += " -A"
     elif namespace and not resource_name:
-        # Only specify namespace if we are getting multiple pods/nodes
         cmd += f" -n {namespace}"
     
     if sort_by:
-        # Use --sort-by for human-readable sorting
         if resource_type == 'pods':
-            # Pod sorting requires the metric path
             cmd += f" --sort-by='.{sort_by}'"
         else:
-            # Node sorting uses the name directly
             cmd += f" --sort-by={sort_by}"
 
     return cmd
+
+
+def delete_pod(
+    pod_name: str,
+    namespace: str = "default",
+    ignore_not_found: bool = True,
+    wait: bool = False,
+    force: bool = False,
+    grace_period: int = 0,
+) -> str:
+    """
+    Deletes a single Pod by name. Intended for isolated, --restart=Never diagnostic pods
+    like 'curltest' or 'dnscheck'. Safe to call even if the pod is already gone.
+
+    Args:
+        pod_name: Name of the pod to delete.
+        namespace: Target namespace.
+        ignore_not_found: If True, don't error if the pod doesn't exist.
+        wait: If False, return immediately without waiting for deletion to complete.
+        force: If True, force immediate deletion (adds --force with grace-period=0). Use only if stuck.
+        grace_period: Seconds to wait before terminating the pod. 0 for immediate.
+    """
+    parts = [
+        "kubectl delete pod",
+        pod_name,
+        f"-n {namespace}",
+    ]
+    if ignore_not_found:
+        parts.append("--ignore-not-found")
+    parts.append(f"--grace-period={int(grace_period)}")
+    if not wait:
+        parts.append("--wait=false")
+    if force:
+        parts.append("--force")
+    return " ".join(parts).strip()
+
+
+def delete_completed_pods(
+    namespace: str = "default",
+    label_selector: str = "",
+    ignore_not_found: bool = True,
+    wait: bool = False,
+) -> str:
+    """
+    Deletes pods in phase Succeeded (typically Completed) in a namespace.
+    Optionally scopes by label selector (e.g., app=myapp).
+
+    Args:
+        namespace: Namespace to target.
+        label_selector: Optional Kubernetes label selector string.
+        ignore_not_found: If True, don't error if no pods match.
+        wait: If False, return immediately without waiting for deletion to finish.
+
+    Notes:
+        - Uses a field selector to match only Succeeded pods (Completed jobs/one-shots).
+        - Label selector is combined (logical AND) with the field selector when provided.
+    """
+    selector_part = f"-l \"{label_selector}\"" if label_selector else ""
+    parts = [
+        "kubectl delete pod",
+        f"-n {namespace}",
+        selector_part,
+        "--field-selector=status.phase=Succeeded",
+    ]
+    if ignore_not_found:
+        parts.append("--ignore-not-found")
+    if not wait:
+        parts.append("--wait=false")
+    return " ".join(p for p in parts if p).strip()
+
+
+def dns_lookup(name: str, namespace: str = "default", pod_name: str = "dnscheck", replace_existing: bool = False) -> str:
+    """
+    Performs an in-cluster DNS lookup using the official dnsutils image.
+
+    Args:
+        name: DNS name to resolve (e.g., 'php-apache.default.svc.cluster.local').
+        namespace: Namespace to create the short-lived pod in.
+        pod_name: Name of the diagnostic pod to create.
+
+    Usage:
+        - Run this instruction, then use get_pod_logs(pod_name, follow=False) to see results,
+          and delete the pod when done.
+    """
+    image = "registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3"
+    run_cmd = (
+        f"kubectl run {pod_name} -n {namespace} --image={image} --restart=Never -- "
+        f"nslookup {name}"
+    )
+    if replace_existing:
+        return f"kubectl delete pod {pod_name} -n {namespace} --ignore-not-found; {run_cmd}"
+    return run_cmd
+
+
+def curl_test(url: str, namespace: str = "default", pod_name: str = "curltest", replace_existing: bool = False) -> str:
+    """
+    Performs a one-shot HTTP reachability test from inside the cluster using curl.
+
+    Args:
+        url: The URL to test (e.g., 'http://php-apache.default.svc.cluster.local/').
+        namespace: Namespace to create the short-lived pod in.
+        pod_name: Name of the diagnostic pod to create.
+
+    Notes:
+        - Avoids curl -w percent format to keep it Windows-shell friendly.
+        - Prints 'OK' on 2xx, 'FAIL' otherwise. View via get_pod_logs.
+    """
+    run_cmd = (
+        f"kubectl run {pod_name} -n {namespace} --image=curlimages/curl --restart=Never -- "
+        f"sh -c \"if curl -s -o /dev/null -f {url}; then echo OK; else echo FAIL; fi\""
+    )
+    if replace_existing:
+        return f"kubectl delete pod {pod_name} -n {namespace} --ignore-not-found; {run_cmd}"
+    return run_cmd
+
+
+# =============================================================================
+# DEPLOYMENT OPERATIONS
+# =============================================================================
 
 def create_deployment_apply(
     deployment_name: str,
@@ -174,23 +315,17 @@ def create_deployment_apply(
         the most robust way to run multi-line scripts on Windows, as it
         bypasses all 'cmd.exe' parsing and quoting issues.
     """
-    
     container_name = deployment_name 
 
-    # --- Conditional Volume YAML Generation ---
     volume_spec = ""
     volume_mount_spec = ""
     
-    # Only generate volume YAML if both a claim name and a mount path are provided
     if pvc_claim_name and volume_mount_path:
-        # Define the volume mount inside the container spec
         volume_mount_spec = f"""
         volumeMounts:
         - name: app-storage
           mountPath: {volume_mount_path}
         """
-        
-        # Define the volume template at the Pod spec level
         volume_spec = f"""
       volumes:
       - name: app-storage
@@ -198,7 +333,6 @@ def create_deployment_apply(
           claimName: {pvc_claim_name}
         """
         
-    # 1. Define the YAML template (dedented to remove Python indentation)
     yaml_template = textwrap.dedent(f"""
         apiVersion: apps/v1
         kind: Deployment
@@ -233,10 +367,7 @@ def create_deployment_apply(
               {volume_spec.strip()}
     """)
 
-    # 2. Define the full PowerShell script we want to run
-    # This script uses a here-string (@'...') to hold the YAML
-    # Note: We must ensure the YAML template is stripped of outer whitespace 
-    # but preserves internal formatting.
+    # PowerShell here-string wraps YAML for kubectl apply
     ps_script = f"""
 $yaml = @'
 {yaml_template.strip()}
@@ -244,13 +375,11 @@ $yaml = @'
 Write-Output $yaml | kubectl apply --wait=false -f -
 """
 
-    # 3. Encode the script for PowerShell
-    # PowerShell's -EncodedCommand requires UTF-16LE encoding before Base64
+    # Encode as UTF-16LE Base64 for PowerShell -EncodedCommand (Windows-safe)
     encoded_script = base64.b64encode(
         ps_script.encode('utf-16-le')
     ).decode('ascii')
 
-    # 4. Return the final, unbreakable command
     return f"powershell -EncodedCommand {encoded_script}"
 
 
@@ -270,16 +399,13 @@ def delete_deployment_and_related(
                          if they share the same name.
     """
     if cleanup_related:
-        # Deletes the Deployment, Service (svc), and HorizontalPodAutoscaler (hpa)
-        # based on the assumption they share the same name (e.g., 'myapp2').
         resources_to_delete = "deployment,svc,hpa"
         return (
             f"kubectl delete {resources_to_delete} {deployment_name} "
             f"-n {namespace} --ignore-not-found"
         )
-    else:
-        # Default behavior: delete only the Deployment
-        return f"kubectl delete deployment {deployment_name} -n {namespace}"
+    return f"kubectl delete deployment {deployment_name} -n {namespace}"
+
 
 def scale_deployment(
     deployment_name: str, 
@@ -297,26 +423,21 @@ def scale_deployment(
         force_manual_scale: If True, this manual scale will override 
                             any active Horizontal Pod Autoscaler (HPA), 
                             which is typically NOT recommended.
+    
+    Notes:
+        In Kubernetes, manually setting replicas when an HPA is active
+        is usually pointless, as the HPA will immediately scale it back.
     """
-    # The parameter 'force_manual_scale' is accepted for API completeness/documentation
-    # but does not change the generated command; keep a reference to avoid lint warnings.
+    # Accepted for API completeness but doesn't change command (avoids lint warning)
     _ = force_manual_scale
-
-    # In Kubernetes, manually setting replicas when an HPA is active
-    # is usually pointless, as the HPA will immediately scale it back.
-    # The agent should rely on other tools (like create_hpa) for policy
-    # but this function is useful for manual overrides.
-
-    # No flags exist to *force* a scale to ignore HPA, but the standard
-    # command is what's required. The added parameter documents the
-    # potential issue for the LLM.
     
     return f"kubectl scale deployment/{deployment_name} -n {namespace} --replicas={replicas}"
+
 
 def set_deployment_resources(
     deployment_name: str, 
     namespace: str = "default", 
-    container_name: str = "*",  # <-- NEW: Allows targeting a specific container
+    container_name: str = "*",
     cpu_request: str = "", 
     memory_request: str = "", 
     cpu_limit: str = "", 
@@ -329,10 +450,9 @@ def set_deployment_resources(
         deployment_name: The Deployment name.
         namespace: The target namespace.
         container_name: The container name to modify (use '*' for all containers).
-        # ... (rest of the resource arguments remain the same)
+        cpu_request, memory_request: Minimum guaranteed resources.
+        cpu_limit, memory_limit: Maximum allowed resources.
     """
-    
-    # 1. Build the --requests string
     requests_args = []
     if cpu_request:
         requests_args.append(f"cpu={cpu_request}")
@@ -341,7 +461,6 @@ def set_deployment_resources(
     
     requests_str = f"--requests={','.join(requests_args)}" if requests_args else ""
 
-    # 2. Build the --limits string
     limits_args = []
     if cpu_limit:
         limits_args.append(f"cpu={cpu_limit}")
@@ -349,11 +468,8 @@ def set_deployment_resources(
         limits_args.append(f"memory={memory_limit}")
 
     limits_str = f"--limits={','.join(limits_args)}" if limits_args else ""
-
-    # 3. Build the container flag (NEW)
     container_str = f"-c {container_name}" 
     
-    # Construct the final command, ensuring only non-empty resource strings are included
     command_parts = [
         f"kubectl set resources deployment/{deployment_name}",
         f"-n {namespace}",
@@ -362,8 +478,84 @@ def set_deployment_resources(
         limits_str
     ]
 
-    # Join and clean up any excessive spaces from empty strings
     return " ".join(part for part in command_parts if part).strip()
+
+
+def get_rollout_history(deployment_name: str, namespace: str = "default", watch_status: bool = False) -> str:
+    """
+    Gets the rollout history of a Deployment, or watches the status of the current rollout.
+    
+    Args:
+        deployment_name: The name of the Deployment.
+        namespace: The target namespace.
+        watch_status: If True, uses 'kubectl rollout status -w' to monitor the current rollout.
+    """
+    if watch_status:
+        return f"kubectl rollout status deployment/{deployment_name} -n {namespace} -w"
+    return f"kubectl rollout history deployment/{deployment_name} -n {namespace}"
+
+
+def undo_rollout(deployment_name: str, namespace: str = "default", revision: int = 0) -> str:
+    """
+    Reverts a Deployment to a previous revision.
+    
+    Args:
+        deployment_name: The name of the Deployment.
+        namespace: The target namespace.
+        revision: The specific revision number to revert to (defaults to the immediately prior revision if 0).
+    """
+    revision_str = f"--to-revision={revision}" if revision > 0 else ""
+    return f"kubectl rollout undo deployment/{deployment_name} -n {namespace} {revision_str}".strip()
+
+
+# =============================================================================
+# SERVICE OPERATIONS
+# =============================================================================
+
+def expose_deployment(
+    deployment_name: str, 
+    namespace: str = "default", 
+    port: int = 80, 
+    target_port: int = 80,
+    service_type: str = "ClusterIP"
+) -> str:
+    """
+    Creates a Service to expose a Deployment.
+    
+    Args:
+        deployment_name: The name of the Deployment to expose.
+        namespace: The target namespace.
+        port: The Service port (what clients connect to).
+        target_port: The container port (what the pod listens on).
+        service_type: Type of Service ('ClusterIP', 'NodePort', or 'LoadBalancer').
+    """
+    valid_types = ["ClusterIP", "NodePort", "LoadBalancer"]
+    if service_type not in valid_types:
+        return f"# Error: Invalid service_type '{service_type}'. Must be one of: {', '.join(valid_types)}"
+
+    target_port_str = f"--target-port={target_port}"
+    return (
+        f"kubectl expose deployment/{deployment_name} -n {namespace} "
+        f"--port={port} {target_port_str} --type={service_type}"
+    )
+
+
+def get_service_endpoints(service_name: str, namespace: str = "default", structured_output: bool = False) -> str:
+    """
+    Retrieves Endpoints for a Service, useful to debug if traffic is routing to ready Pods.
+
+    Args:
+        service_name: The Service name.
+        namespace: Namespace of the Service.
+        structured_output: If True, return JSON (-o json); otherwise a human-readable wide view.
+    """
+    cmd = f"kubectl get endpoints {service_name} -n {namespace}"
+    return f"{cmd} -o json" if structured_output else f"{cmd} -o wide"
+
+
+# =============================================================================
+# HPA (HORIZONTAL POD AUTOSCALER) OPERATIONS
+# =============================================================================
 
 def create_hpa(
     deployment_name: str, 
@@ -384,15 +576,13 @@ def create_hpa(
         cpu_utilization: Target CPU utilization percentage (e.g., 80).
         memory_utilization: Target Memory utilization percentage (optional, e.g., 75).
     """
-    
-    # HPA can only target one metric when using `kubectl autoscale`
+    # kubectl autoscale only supports one metric target
     if memory_utilization > 0 and cpu_utilization > 0:
         return "# Error: kubectl autoscale only supports one metric target. Please choose CPU or Memory."
         
     if memory_utilization > 0:
         metric_str = f"--memory-percent={memory_utilization}"
     else:
-        # Default to CPU utilization
         metric_str = f"--cpu-percent={cpu_utilization}"
         
     return (
@@ -400,151 +590,7 @@ def create_hpa(
         f"--min={min_replicas} --max={max_replicas} {metric_str}"
     )
 
-def expose_deployment(
-    deployment_name: str, 
-    namespace: str = "default", 
-    port: int = 80, 
-    target_port: int = 80,  # Improved: Set a sensible default for clarity
-    service_type: str = "ClusterIP"
-) -> str:
-    """
-    Creates a Service to expose a Deployment.
-    
-    Args:
-        deployment_name: The name of the Deployment to expose.
-        namespace: The target namespace.
-        port: The Service port (what clients connect to).
-        target_port: The container port (what the pod listens on).
-        service_type: Type of Service ('ClusterIP', 'NodePort', or 'LoadBalancer').
-    """
-    
-    # Validation for common types
-    valid_types = ["ClusterIP", "NodePort", "LoadBalancer"]
-    if service_type not in valid_types:
-        return f"# Error: Invalid service_type '{service_type}'. Must be one of: {', '.join(valid_types)}"
 
-    # The expose command requires the target-port if it differs from the port
-    # It's cleaner to always provide it for an LLM to follow the flow.
-    target_port_str = f"--target-port={target_port}"
-    
-    return (
-        f"kubectl expose deployment/{deployment_name} -n {namespace} "
-        f"--port={port} {target_port_str} --type={service_type}"
-    )
-
-def get_service_endpoints(service_name: str, namespace: str = "default", structured_output: bool = False) -> str:
-    """
-    Retrieves Endpoints for a Service, useful to debug if traffic is routing to ready Pods.
-
-    Args:
-        service_name: The Service name.
-        namespace: Namespace of the Service.
-        structured_output: If True, return JSON (-o json); otherwise a human-readable wide view.
-    """
-    cmd = f"kubectl get endpoints {service_name} -n {namespace}"
-    return f"{cmd} -o json" if structured_output else f"{cmd} -o wide"
-
-def get_rollout_history(deployment_name: str, namespace: str = "default", watch_status: bool = False) -> str:
-    """
-    Gets the rollout history of a Deployment, or watches the status of the current rollout.
-    
-    Args:
-        deployment_name: The name of the Deployment.
-        namespace: The target namespace.
-        watch_status: If True, uses 'kubectl rollout status -w' to monitor the current rollout.
-    """
-    if watch_status:
-        return f"kubectl rollout status deployment/{deployment_name} -n {namespace} -w"
-        
-    # Default behavior: show history
-    return f"kubectl rollout history deployment/{deployment_name} -n {namespace}"
-
-
-def undo_rollout(deployment_name: str, namespace: str = "default", revision: int = 0) -> str:
-    """
-    Reverts a Deployment to a previous revision.
-    
-    Args:
-        deployment_name: The name of the Deployment.
-        namespace: The target namespace.
-        revision: The specific revision number to revert to (defaults to the immediately prior revision if 0).
-    """
-    # Note: If revision is 0, no flag is used, and Kubernetes rolls back to the previous version.
-    revision_str = f"--to-revision={revision}" if revision > 0 else ""
-    
-    return f"kubectl rollout undo deployment/{deployment_name} -n {namespace} {revision_str}".strip()
-
-def get_events(namespace: str = "default", watch: bool = False, sort_by_time: bool = True) -> str:
-    """
-    Gets cluster events.
-    
-    Args:
-        namespace: The namespace to query (or use -A for all).
-        watch: If True, streams the events as they occur (-w).
-        sort_by_time: If True, sorts events by timestamp (recommended).
-    """
-    watch_str = "-w" if watch else ""
-    sort_str = "--sort-by='.lastTimestamp'" if sort_by_time else ""
-    
-    # Use -A if namespace is set to a common all-namespace indicator (like "all" or "*")
-    if namespace.lower() in ("all", "*"):
-         return f"kubectl get events -A {watch_str} {sort_str}".strip()
-
-    return f"kubectl get events -n {namespace} {watch_str} {sort_str}".strip()
-
-def create_configmap(configmap_name: str, namespace: str = "default", data: dict = None, from_file: str = "") -> str:
-    """
-    Creates or UPDATES a ConfigMap (idempotent operation) using the
-    kubectl dry-run/apply pattern. This ensures the ConfigMap is created
-    if it doesn't exist, or modified if it does.
-    
-    The command is encoded via Base64 for reliable execution on Windows.
-
-    Args:
-        configmap_name: The name for the new/existing ConfigMap.
-        namespace: The target namespace.
-        data: A dictionary of key/value pairs to include (e.g., {'key': 'value'}).
-              This is used with --from-literal.
-        from_file: Path to a local file/directory to use (uses --from-file).
-                   If provided, 'data' is ignored.
-    
-    Returns:
-        A string command for 'powershell -EncodedCommand' that handles the
-        ConfigMap creation or update.
-    """
-    
-    # 1. Determine the base 'kubectl create' command (The YAML generator)
-    if from_file:
-        # If using --from-file, put quotes around the file path for safety
-        base_cmd = f"kubectl create configmap {configmap_name} -n {namespace} --from-file='{from_file}'"
-    
-    elif data:
-        # Build the --from-literal arguments, quoting values for safety
-        from_literal = " ".join([f"--from-literal={key}='{value}'" for key, value in data.items()])
-        base_cmd = f"kubectl create configmap {configmap_name} -n {namespace} {from_literal}"
-    
-    else:
-        # Handle the case where no data source is provided
-        return f"# Error: Must provide 'data' (dict) or 'from_file' (str) to create/update configmap {configmap_name}"
-
-    # 2. Define the full PowerShell script
-    # This script chains: CREATE (dry-run to generate YAML) -> PIPE -> APPLY (to update/create)
-    ps_script = textwrap.dedent(f"""
-        # The full command to execute safely inside PowerShell
-        {base_cmd} --dry-run=client -o yaml | kubectl apply -f -
-    """)
-    
-    # 3. Encode the script for PowerShell
-    # PowerShell's -EncodedCommand requires UTF-16LE encoding before Base64
-    encoded_script = base64.b64encode(
-        ps_script.encode('utf-16-le')
-    ).decode('ascii')
-
-    # 4. Return the final, single-line, unbreakable command for asyncio.create_subprocess_shell
-    return f"powershell -EncodedCommand {encoded_script}"
-
-
-# --- Kubernetes best-practice helpers ---
 def check_hpa_readiness(namespace: str = "default") -> str:
     """
     Checks if the cluster is ready for HPA in a given namespace.
@@ -593,8 +639,8 @@ def check_hpa_readiness(namespace: str = "default") -> str:
             }
         }
 
-    $withCpu = ($items | Where-Object { $_.hasCpuRequests }).Count
-    $withoutCpu = ($items | Where-Object { -not $_.hasCpuRequests }).Count
+        $withCpu = ($items | Where-Object { $_.hasCpuRequests }).Count
+        $withoutCpu = ($items | Where-Object { -not $_.hasCpuRequests }).Count
 
         $summary = [pscustomobject]@{
             namespace = $ns
@@ -609,6 +655,56 @@ def check_hpa_readiness(namespace: str = "default") -> str:
     encoded = base64.b64encode(ps_script.encode('utf-16-le')).decode('ascii')
     return f"powershell -EncodedCommand {encoded}"
 
+
+# =============================================================================
+# CONFIGMAP OPERATIONS
+# =============================================================================
+
+def create_configmap(configmap_name: str, namespace: str = "default", data: dict = None, from_file: str = "") -> str:
+    """
+    Creates or UPDATES a ConfigMap (idempotent operation) using the
+    kubectl dry-run/apply pattern. This ensures the ConfigMap is created
+    if it doesn't exist, or modified if it does.
+    
+    The command is encoded via Base64 for reliable execution on Windows.
+
+    Args:
+        configmap_name: The name for the new/existing ConfigMap.
+        namespace: The target namespace.
+        data: A dictionary of key/value pairs to include (e.g., {'key': 'value'}).
+              This is used with --from-literal.
+        from_file: Path to a local file/directory to use (uses --from-file).
+                   If provided, 'data' is ignored.
+    
+    Returns:
+        A string command for 'powershell -EncodedCommand' that handles the
+        ConfigMap creation or update.
+    """
+    if from_file:
+        base_cmd = f"kubectl create configmap {configmap_name} -n {namespace} --from-file='{from_file}'"
+    elif data:
+        from_literal = " ".join([f"--from-literal={key}='{value}'" for key, value in data.items()])
+        base_cmd = f"kubectl create configmap {configmap_name} -n {namespace} {from_literal}"
+    else:
+        return f"# Error: Must provide 'data' (dict) or 'from_file' (str) to create/update configmap {configmap_name}"
+
+    ps_script = textwrap.dedent(f"""
+        {base_cmd} --dry-run=client -o yaml | kubectl apply -f -
+    """)
+    
+    # Encode as UTF-16LE Base64 for PowerShell -EncodedCommand (Windows-safe)
+    encoded_script = base64.b64encode(ps_script.encode('utf-16-le')).decode('ascii')
+    return f"powershell -EncodedCommand {encoded_script}"
+
+
+def delete_configmap(configmap_name: str, namespace: str = "default") -> str:
+    """Deletes a ConfigMap by name. Safe to call even if it doesn't exist."""
+    return f"kubectl delete configmap {configmap_name} -n {namespace} --ignore-not-found"
+
+
+# =============================================================================
+# CONTEXT AND NAMESPACE MANAGEMENT
+# =============================================================================
 
 def list_contexts() -> str:
     """Lists all kubeconfig contexts."""
@@ -630,129 +726,10 @@ def list_namespaces() -> str:
     return "kubectl get ns"
 
 
-def dns_lookup(name: str, namespace: str = "default", pod_name: str = "dnscheck", replace_existing: bool = False) -> str:
-    """
-    Performs an in-cluster DNS lookup using the official dnsutils image.
+# =============================================================================
+# LOAD TESTING AND DIAGNOSTIC HELPERS
+# =============================================================================
 
-    Args:
-        name: DNS name to resolve (e.g., 'php-apache.default.svc.cluster.local').
-        namespace: Namespace to create the short-lived pod in.
-        pod_name: Name of the diagnostic pod to create.
-
-    Usage:
-        - Run this instruction, then use get_pod_logs(pod_name, follow=False) to see results,
-          and delete the pod when done.
-    """
-    image = "registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3"
-    run_cmd = (
-        f"kubectl run {pod_name} -n {namespace} --image={image} --restart=Never -- "
-        f"nslookup {name}"
-    )
-    if replace_existing:
-        # Pre-delete any existing pod to avoid AlreadyExists; semicolon is safe in PowerShell
-        return f"kubectl delete pod {pod_name} -n {namespace} --ignore-not-found; {run_cmd}"
-    return run_cmd
-
-
-def curl_test(url: str, namespace: str = "default", pod_name: str = "curltest", replace_existing: bool = False) -> str:
-    """
-    Performs a one-shot HTTP reachability test from inside the cluster using curl.
-
-    Args:
-        url: The URL to test (e.g., 'http://php-apache.default.svc.cluster.local/').
-        namespace: Namespace to create the short-lived pod in.
-        pod_name: Name of the diagnostic pod to create.
-
-    Notes:
-        - Avoids curl -w percent format to keep it Windows-shell friendly.
-        - Prints 'OK' on 2xx, 'FAIL' otherwise. View via get_pod_logs.
-    """
-    run_cmd = (
-        f"kubectl run {pod_name} -n {namespace} --image=curlimages/curl --restart=Never -- "
-        f"sh -c \"if curl -s -o /dev/null -f {url}; then echo OK; else echo FAIL; fi\""
-    )
-    if replace_existing:
-        return f"kubectl delete pod {pod_name} -n {namespace} --ignore-not-found; {run_cmd}"
-    return run_cmd
-
-
-
-
-# --- Pod deletion helpers ---
-def delete_pod(
-    pod_name: str,
-    namespace: str = "default",
-    ignore_not_found: bool = True,
-    wait: bool = False,
-    force: bool = False,
-    grace_period: int = 0,
-) -> str:
-    """
-    Deletes a single Pod by name. Intended for isolated, --restart=Never diagnostic pods
-    like 'curltest' or 'dnscheck'. Safe to call even if the pod is already gone.
-
-    Args:
-        pod_name: Name of the pod to delete.
-        namespace: Target namespace.
-        ignore_not_found: If True, don't error if the pod doesn't exist.
-        wait: If False, return immediately without waiting for deletion to complete.
-        force: If True, force immediate deletion (adds --force with grace-period=0). Use only if stuck.
-        grace_period: Seconds to wait before terminating the pod. 0 for immediate.
-    """
-    parts = [
-        "kubectl delete pod",
-        pod_name,
-        f"-n {namespace}",
-    ]
-    if ignore_not_found:
-        parts.append("--ignore-not-found")
-    # Grace period
-    parts.append(f"--grace-period={int(grace_period)}")
-    # Wait behavior
-    if not wait:
-        parts.append("--wait=false")
-    # Force (use sparingly; may be deprecated but still widely available)
-    if force:
-        parts.append("--force")
-    return " ".join(parts).strip()
-
-
-def delete_completed_pods(
-    namespace: str = "default",
-    label_selector: str = "",
-    ignore_not_found: bool = True,
-    wait: bool = False,
-) -> str:
-    """
-    Deletes pods in phase Succeeded (typically Completed) in a namespace.
-    Optionally scopes by label selector (e.g., app=myapp).
-
-    Args:
-        namespace: Namespace to target.
-        label_selector: Optional Kubernetes label selector string.
-        ignore_not_found: If True, don't error if no pods match.
-        wait: If False, return immediately without waiting for deletion to finish.
-
-    Notes:
-        - Uses a field selector to match only Succeeded pods (Completed jobs/one-shots).
-        - Label selector is combined (logical AND) with the field selector when provided.
-    """
-    selector_part = f"-l \"{label_selector}\"" if label_selector else ""
-    parts = [
-        "kubectl delete pod",
-        f"-n {namespace}",
-        selector_part,
-        "--field-selector=status.phase=Succeeded",
-    ]
-    if ignore_not_found:
-        parts.append("--ignore-not-found")
-    if not wait:
-        parts.append("--wait=false")
-    # Clean up extra spaces
-    return " ".join(p for p in parts if p).strip()
-
-
-# --- Convenience: in-cluster HTTP load generators for HPA demos ---
 def start_http_load(
     pod_name: str = "curlgen",
     namespace: str = "default",
@@ -781,7 +758,6 @@ def start_http_load(
             f"kubectl run {pod_name} -n {namespace} --image=busybox --restart=Never -- "
             f"/bin/sh -c \"while true; do wget -q -O- {url} > /dev/null; done\""
         )
-    # default: curl
     return (
         f"kubectl run {pod_name} -n {namespace} --image=curlimages/curl --restart=Never -- "
         f"sh -c \"while true; do curl -s {url} > /dev/null; done\""
@@ -817,12 +793,10 @@ def start_http_load_stats(
     gen = (generator or "curl").lower()
     b = max(1, int(burst_per_second))
     if gen == "busybox":
-        # busybox + wget variant (avoid % in date format due to Windows cmd.exe parsing)
         return (
             f"kubectl run {pod_name} -n {namespace} --image=busybox --restart=Never -- "
             f"/bin/sh -c \"while true; do c=0; i=0; while [ $i -lt {b} ]; do wget -q -O- {url} > /dev/null && c=$((c+1)); i=$((i+1)); done; echo $(date) hits/s=$c; done\""
         )
-    # default: curl variant
     return (
         f"kubectl run {pod_name} -n {namespace} --image=curlimages/curl --restart=Never -- "
         f"sh -c \"while true; do c=0; i=0; while [ $i -lt {b} ]; do curl -s -o /dev/null {url} && c=$((c+1)); i=$((i+1)); done; echo $(date) hits/s=$c; done\""
@@ -833,8 +807,4 @@ def stop_http_load_stats(pod_name: str = "curlstats", namespace: str = "default"
     """Stops and deletes the stats pod created by start_http_load_stats."""
     return f"kubectl delete pod {pod_name} -n {namespace} --ignore-not-found"
 
-
-def delete_configmap(configmap_name: str, namespace: str = "default") -> str:
-    """Deletes a ConfigMap by name. Safe to call even if it doesn't exist."""
-    return f"kubectl delete configmap {configmap_name} -n {namespace} --ignore-not-found"
 

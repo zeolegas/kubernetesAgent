@@ -1,20 +1,57 @@
+"""
+MCP Server for Kubernetes Agent
+
+A FastAPI-based server that exposes kubectl operations through an MCP (Model Context Protocol)
+interface. The server dynamically discovers available operations from the prompts module,
+validates all inputs for security, and provides optional confirmation gates for mutating operations.
+
+Key Features:
+- Dynamic operation discovery from prompts module
+- Input validation and sanitization (prevents injection attacks)
+- Confirmation gates for cluster-modifying operations
+- Structured logging with sensitive data redaction
+- Dry-run preview support for kubectl commands
+- Context caching to reduce kubectl overhead
+
+Security:
+- Validates namespace names (DNS label format)
+- Allowlists for resource types and service types
+- Validates CPU/memory quantities with regex
+- Detects and blocks shell control characters
+- Requires explicit confirmation for mutations (configurable)
+"""
+
 import asyncio
 import inspect
-import logging
 import json
+import logging
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from typing import Any, Dict, Optional
+
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from typing import Dict, Any, Optional
 
 from k8s_mcp_server import prompts
 
 
-# --- Logging setup (structured JSON, rotating file) ---
+# ============================================================================
+# WINDOWS COMPATIBILITY FIX
+# ============================================================================
+# Windows requires ProactorEventLoop for subprocess support
+# This is set here as a fallback, but __main__.py sets it before uvicorn starts
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
 logs_dir = os.path.join(os.getcwd(), "logs")
 os.makedirs(logs_dir, exist_ok=True)
 server_log_path = os.path.join(logs_dir, "mcp_server.log")
@@ -48,17 +85,31 @@ if not logger.handlers:
 
 app = FastAPI(title="K8s MCP Server")
 
-# Dynamically discover prompt functions from the prompts module
-PROMPT_FUNCTIONS = {
+@app.on_event("startup")
+async def startup_event():
+    """Ensure Windows uses ProactorEventLoop for subprocess support"""
+    if sys.platform == 'win32':
+        loop = asyncio.get_event_loop()
+        if not isinstance(loop, asyncio.ProactorEventLoop):
+            logger.warning("Windows detected but not using ProactorEventLoop - subprocess calls may fail")
+    logger.info("MCP Server startup complete")
+
+
+# ============================================================================
+# CONSTANTS & CONFIGURATION
+# ============================================================================
+
+# Dynamic operation discovery: automatically find all prompt functions
+PROMPT_FUNCTIONS: Dict[str, Any] = {
     name: func
     for name, func in inspect.getmembers(prompts, inspect.isfunction)
     if not name.startswith("_")
 }
 
-# Feature flag: require explicit confirmation for mutating operations
+# Security: require confirmation for cluster-modifying operations (env configurable)
 REQUIRE_CONFIRM_FOR_MUTATIONS = str(os.getenv("REQUIRE_CONFIRM_FOR_MUTATIONS", "true")).lower() in {"1", "true", "yes"}
 
-# Heuristics for mutating operations (centralized constants)
+# Mutation detection heuristics - operations that modify cluster state
 MUTATING_PREFIXES = (
     "create_", "delete_", "scale_", "set_", "expose_", "undo_", "start_", "stop_",
 )
@@ -68,8 +119,42 @@ MUTATING_TOKENS = (
     " kubectl run ",
 )
 
+# Sensitive data keys for log redaction
+SENSITIVE_KEYS = {"OPENAI_API_KEY", "api_key", "token", "password", "secret", "credential"}
+
+# Allowed resource types (security allowlist)
+ALLOWED_RESOURCE_TYPES = {
+    # Core resources
+    "pod", "pods", "deployment", "deployments", "service", "services", "svc",
+    "endpoint", "endpoints", "endpointslice", "endpointslices",
+    "node", "nodes", "event", "events", "namespace", "namespaces", "ns",
+    # Workloads
+    "daemonset", "daemonsets", "statefulset", "statefulsets", "job", "jobs", "cronjob", "cronjobs",
+    # Config & Storage
+    "configmap", "configmaps", "cm", "secret", "secrets",
+    "persistentvolumeclaim", "persistentvolumeclaims", "pvc",
+    "persistentvolume", "persistentvolumes", "pv",
+    # Networking
+    "ingress", "ingresses",
+    # Autoscaling
+    "horizontalpodautoscaler", "hpa",
+}
+
+# Allowed service types (security allowlist)
+ALLOWED_SERVICE_TYPES = {"ClusterIP", "NodePort", "LoadBalancer"}
+
+# Resource quantity validation patterns
+_CPU_QTY_RE = re.compile(r"^(?:\d+(?:\.\d+)?|\d+m)$")
+_MEM_SUFFIXES = "Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E"
+_MEM_QTY_RE = re.compile(rf"^\d+(?:\.\d+)?(?:({_MEM_SUFFIXES}))?$")
+
+
+# ============================================================================
+# DISPLAY HELPERS
+# ============================================================================
+
 def _display_command(cmd: str) -> str:
-    """Return a human-friendly command for UI. Hide Base64 details for PowerShell scripts."""
+    """Return a human-friendly command for UI, hiding Base64 PowerShell encoding details"""
     try:
         if "powershell -EncodedCommand" in cmd:
             # We know our encoded scripts pipe YAML to kubectl apply -f -
@@ -83,34 +168,49 @@ _CPU_QTY_RE = re.compile(r"^(?:\d+(?:\.\d+)?|\d+m)$")
 _MEM_SUFFIXES = "Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E"
 _MEM_QTY_RE = re.compile(rf"^\d+(?:\.\d+)?(?:({_MEM_SUFFIXES}))?$")
 
+
+# ============================================================================
+# VALIDATION HELPERS
+# ============================================================================
+
 def _is_valid_cpu_qty(val: str) -> bool:
+    """Validate CPU quantity format (e.g., '0.5', '1', '100m')"""
     try:
         return bool(_CPU_QTY_RE.fullmatch(str(val)))
     except Exception:
         return False
 
 def _is_valid_mem_qty(val: str) -> bool:
+    """Validate memory quantity format (e.g., '128Mi', '1Gi')"""
     try:
         return bool(_MEM_QTY_RE.fullmatch(str(val)))
     except Exception:
         return False
 
 def _suggest_mem_fix(val: str) -> Optional[str]:
+    """Suggest fix for common memory quantity typos (e.g., '4i' → '4Mi')"""
     try:
         s = str(val)
-        # Very common typo: "4i" -> "4Mi"
         if re.fullmatch(r"^\d+i$", s):
             return s[:-1] + "Mi"
         return None
     except Exception:
         return None
 
+
+# ============================================================================
+# REQUEST MODELS
+# ============================================================================
+
 class MCPRequest(BaseModel):
+    """MCP-style request with instruction name and optional parameters"""
     instruction: str
     params: Optional[Dict[str, Any]] = {}
 
-# --- Redaction helper to protect sensitive values in logs ---
-SENSITIVE_KEYS = {"openai_api_key", "api_key", "authorization", "token", "password"}
+
+# ============================================================================
+# SECURITY & REDACTION
+# ============================================================================
 
 def redact_value(val: str) -> str:
     if not isinstance(val, str):
@@ -136,11 +236,15 @@ def redact_dict(d: dict) -> dict:
     except Exception:
         return d
 
-# --- Kube context info (cached) ---
+
+# ============================================================================
+# KUBECTL CONTEXT (CACHED)
+# ============================================================================
+
 _ctx_cache = {"ts": 0, "data": {"current_context": None, "default_namespace": None}}
 
 async def _get_kube_context_info() -> Dict[str, Any]:
-    # Refresh every 60s at most
+    """Get current kubectl context with 60-second caching to reduce overhead"""
     now = time.time()
     if now - _ctx_cache["ts"] < 60 and _ctx_cache["data"]["current_context"] is not None:
         return _ctx_cache["data"]
@@ -164,9 +268,14 @@ async def _get_kube_context_info() -> Dict[str, Any]:
     _ctx_cache["ts"] = now
     return data
 
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
 @app.get("/mcp/instructions")
 async def get_instructions():
-    """Returns a list of available instructions with their docstrings and arguments."""
+    """Returns a list of available instructions with their docstrings and arguments"""
     
     instructions_with_details = {}
     

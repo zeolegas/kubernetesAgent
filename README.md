@@ -325,7 +325,7 @@ k8s-agent-mcp-project/
 └── README.md                  # This file
 ```
 
-## Recent Improvements (Oct 2025)
+## Recent Improvements
 
 **Server Refactoring** (6/10 → 8.5/10):
 - Fixed Windows subprocess NotImplementedError with ProactorEventLoopPolicy

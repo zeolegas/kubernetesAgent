@@ -4,7 +4,7 @@ A production-ready FastAPI server that exposes kubectl operations through an MCP
 
 ## Code Quality: 8.5/10 ✅
 
-**Recent Improvements** (Oct 2025):
+**Recent Improvements**:
 - Fixed Windows subprocess NotImplementedError
 - Refactored from 430-line monolith to modular architecture
 - Added 17 comprehensive tests (15 unit + 2 integration)

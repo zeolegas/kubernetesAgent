@@ -69,14 +69,14 @@
 
 1. **Start MCP Server (Terminal 1):**
    ```powershell
-   cd "c:\Users\joseo\ds\kubemcp\k8s-agent-mcp-project\mcp_server"
-   $env:PYTHONPATH="src"; C:\Users\joseo\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\Local\pypoetry\Cache\virtualenvs\k8s-mcp-server-ZzDOt2Ac-py3.12\Scripts\python.exe -m uvicorn k8s_mcp_server.server:app --host 0.0.0.0 --port 8080 --reload
+   cd mcp_server
+   python -m k8s_mcp_server
    ```
 
 2. **Start Agent (Terminal 2):**
    ```powershell
-   cd "c:\Users\joseo\ds\kubemcp\k8s-agent-mcp-project\agent"
-   C:\Users\joseo\ds\kubemcp\k8s-agent-mcp-project\agent\.venv\Scripts\Activate.ps1
+   cd agent
+   .\.venv\Scripts\Activate.ps1
    python agent.py
    ```
 

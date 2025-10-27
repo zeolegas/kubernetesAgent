@@ -581,9 +581,9 @@ def create_hpa(
         return "# Error: kubectl autoscale only supports one metric target. Please choose CPU or Memory."
         
     if memory_utilization > 0:
-        metric_str = f"--memory-percent={memory_utilization}"
+        metric_str = f"--memory={memory_utilization}%"
     else:
-        metric_str = f"--cpu-percent={cpu_utilization}"
+        metric_str = f"--cpu={cpu_utilization}%"
         
     return (
         f"kubectl autoscale deployment/{deployment_name} -n {namespace} "
